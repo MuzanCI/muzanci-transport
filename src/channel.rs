@@ -5,8 +5,15 @@ use crate::mux::Command;
 
 use crate::mux::{Frame, MuxError};
 
-pub type ChannelId = u64;
+pub type ChannelId = uuid::Uuid;
 pub type WorkerId = u64;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum ChannelType {
+    Scheduler,
+    Runner,
+    Tunnel,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum RunnerEvent {
@@ -17,18 +24,59 @@ pub enum RunnerEvent {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunnerConfig {
+    runner_id: u64,
+    repo_owner: String,
+    repo_name: String,
+    commit_sha: String,
+    worker_capacity: u64,
+}
+
+impl RunnerConfig {
+    pub fn runner_id(&self) -> u64 {
+        self.runner_id
+    }
+
+    pub fn repo_owner(&self) -> &str {
+        &self.repo_owner
+    }
+
+    pub fn repo_name(&self) -> &str {
+        &self.repo_name
+    }
+
+    pub fn commit_sha(&self) -> &str {
+        &self.commit_sha
+    }
+
+    pub fn worker_capacity(&self) -> u64 {
+        self.worker_capacity
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Message {
     /// A packet of data.
     Data(#[serde(with = "serde_bytes")] Vec<u8>),
 
     /// A control message to open a channel.
-    OpenChannelRequest { channel_id: ChannelId },
+    OpenChannelRequest {
+        channel_id: ChannelId,
+        channel_type: ChannelType,
+        buffer_size: usize,
+    },
 
     /// A control message to acknowledge successful channel open.
     OpenChannelResponse {
         channel_id: ChannelId,
         result: Result<(), String>,
     },
+
+    InitializeRunnerRequest {
+        worker_id: WorkerId,
+    },
+
+    InitializeRunnerResponse(Result<RunnerConfig, String>),
 
     /// A control message
     /// A lifecycle event for a Runner.
@@ -148,77 +196,56 @@ impl Drop for ChannelHandle {
     }
 }
 
+/// A function that accepts a channel handle and returns a future that sends
+/// and receives messages on the channel.
+type ChannelFutureFn = dyn FnOnce(ChannelHandle) -> BoxFuture<'static, ()> + Send;
+
 /// Provides an operation to handle a channel open request from the peer.
-pub trait OpenChannelRequestHandler
+pub trait ChannelAcceptor
 where
     Self: Clone + Send + 'static,
 {
-    fn handle(
+    fn future_fn(
         &self,
         channel_id: ChannelId,
-    ) -> Result<Box<dyn FnOnce(ChannelHandle) -> BoxFuture<'static, ()> + Send>, String>;
+        channel_type: ChannelType,
+    ) -> Result<Box<ChannelFutureFn>, String>;
 }
 
-/// A [`OpenChannelRequestHandler`] that is constructed from a closure.
-///
-/// Example usage:
-///
-/// ```
-/// let handler = FnOpenChannelRequestHandler::new(move |channel_id| {
-///     if !allowed_channels.contains(&channel_id) {
-///         return Err(format!("channel {} not permitted", channel_id));
-///     }
-///     let state = app_state.clone();
-///     Ok(accept(move |handle| async move {
-///         run_ssh_server(handle, state).await;
-///     }))
-/// });
-/// ```
-///
+/// A [`ChannelAcceptor`] that is constructed from a closure.
 #[derive(Clone)]
-pub struct FnOpenChannelRequestHandler<F> {
+pub struct FnChannelAcceptor<F> {
     f: F,
 }
 
-impl<F> FnOpenChannelRequestHandler<F>
+impl<F> FnChannelAcceptor<F>
 where
-    F: Fn(
-            ChannelId,
-        )
-            -> Result<Box<dyn FnOnce(ChannelHandle) -> BoxFuture<'static, ()> + Send>, String>
-        + Clone
-        + Send
-        + 'static,
+    F: Fn(ChannelId, ChannelType) -> Result<Box<ChannelFutureFn>, String> + Clone + Send + 'static,
 {
     pub fn new(f: F) -> Self {
         Self { f }
     }
 }
 
-impl<F> OpenChannelRequestHandler for FnOpenChannelRequestHandler<F>
+impl<F> ChannelAcceptor for FnChannelAcceptor<F>
 where
-    F: Fn(
-            ChannelId,
-        )
-            -> Result<Box<dyn FnOnce(ChannelHandle) -> BoxFuture<'static, ()> + Send>, String>
-        + Clone
-        + Send
-        + 'static,
+    F: Fn(ChannelId, ChannelType) -> Result<Box<ChannelFutureFn>, String> + Clone + Send + 'static,
 {
-    fn handle(
+    fn future_fn(
         &self,
         channel_id: ChannelId,
-    ) -> Result<Box<dyn FnOnce(ChannelHandle) -> BoxFuture<'static, ()> + Send>, String> {
-        (self.f)(channel_id)
+        channel_type: ChannelType,
+    ) -> Result<Box<ChannelFutureFn>, String> {
+        (self.f)(channel_id, channel_type)
     }
 }
 
 /// Convenience function: converts an async fn(ChannelHandle) into the
-/// boxed FnOnce that OpenChannelRequestHandler::handle must return.
+/// boxed FnOnce that ChannelAcceptor::accept must return.
 ///
-/// Use this inside your FnOpenChannelRequestHandler closure to avoid writing
+/// Use this inside your FnChannelAcceptor closure to avoid writing
 /// Box::new and Box::pin at every call site.
-pub fn accept<F, Fut>(f: F) -> Box<dyn FnOnce(ChannelHandle) -> BoxFuture<'static, ()> + Send>
+pub fn accept<F, Fut>(f: F) -> Box<ChannelFutureFn>
 where
     F: FnOnce(ChannelHandle) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,

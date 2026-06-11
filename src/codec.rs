@@ -21,7 +21,7 @@ impl Codec {
     }
 }
 
-const HEADER_SIZE: usize = 10; // 2 bytes for payload length, 8 bytes for channel ID
+const HEADER_SIZE: usize = 2 + 16; // 2 bytes for payload length, 16 bytes for channel ID
 const PAYLOAD_MAX_SIZE: usize = 1 << 16; // 64 kilobytes
 
 impl Encoder<Frame> for Codec {
@@ -34,7 +34,7 @@ impl Encoder<Frame> for Codec {
         }
         dst.reserve(HEADER_SIZE + payload.len());
         dst.put_u16(payload.len() as u16);
-        dst.put_u64(item.channel_id);
+        dst.put_slice(item.channel_id.as_bytes());
         dst.put_slice(&payload);
         Ok(())
     }
@@ -52,9 +52,7 @@ impl Decoder for Codec {
         if payload_len > PAYLOAD_MAX_SIZE {
             return Err(CodecError::FrameTooLarge(payload_len));
         }
-        let channel_id = u64::from_be_bytes([
-            src[2], src[3], src[4], src[5], src[6], src[7], src[8], src[9],
-        ]);
+        let channel_id = uuid::Uuid::from_slice(&src[2..18]).unwrap();
         let total = HEADER_SIZE + payload_len;
         if src.len() < total {
             return Ok(None);

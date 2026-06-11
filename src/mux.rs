@@ -7,22 +7,16 @@
 //! - Keeps track of open channels and constructs channel handles for other tasks.
 //! - Receiving frames from the underlying data stream, decoding them, and forwarding messages to the appropriate channel handle.
 //! - Forwards messages from channel handles to the underlying data stream, encoding them as frames.
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::collections::HashMap;
 
-use futures::channel;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::Framed;
 
+use crate::channel::ChannelType;
 use crate::{
-    channel::{ChannelHandle, ChannelId, ChannelState, Message, OpenChannelRequestHandler},
+    channel::{ChannelAcceptor, ChannelHandle, ChannelId, ChannelState, Message},
     codec::Codec,
 };
 
@@ -66,6 +60,7 @@ pub enum Command {
     /// Otherwise, the mux will reply with an error.
     OpenChannel {
         channel_id: ChannelId,
+        channel_type: ChannelType,
         buffer_size: usize,
         reply: oneshot::Sender<Result<mpsc::Receiver<Message>, MuxError>>,
     },
@@ -85,14 +80,17 @@ pub struct MuxHandle {
 }
 
 impl MuxHandle {
-    pub async fn open_channel(&self, buffer_size: usize) -> Result<ChannelHandle, MuxError> {
-        let channel_id = 0; // TODO: Replace with UUIDv7
-
+    pub async fn open_channel(
+        &self,
+        channel_type: ChannelType,
+        buffer_size: usize,
+    ) -> Result<ChannelHandle, MuxError> {
+        let channel_id = uuid::Uuid::now_v7();
         let (reply_tx, reply_rx) = oneshot::channel();
-
         self.command_tx
             .send(Command::OpenChannel {
                 channel_id,
+                channel_type,
                 buffer_size,
                 reply: reply_tx,
             })
@@ -114,7 +112,7 @@ impl MuxHandle {
 
     pub async fn send_control(&self, message: Message) -> Result<(), MuxError> {
         let frame = Frame {
-            channel_id: 0, // TODO: Replace with null UUID
+            channel_id: uuid::Uuid::nil(),
             message,
         };
         self.frame_tx
@@ -124,13 +122,13 @@ impl MuxHandle {
     }
 }
 
-pub trait ThreadSafeStream
+pub trait TokioStream
 where
     Self: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
 }
 
-impl<T> ThreadSafeStream for T where
+impl<T> TokioStream for T where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
 {
 }
@@ -146,10 +144,10 @@ struct PendingOpenChannel {
     message_rx: mpsc::Receiver<Message>,
 }
 
-pub struct Mux<Stream, OpenChannelHandler>
+pub struct Mux<Stream, Acceptor>
 where
-    Stream: ThreadSafeStream,
-    OpenChannelHandler: OpenChannelRequestHandler,
+    Stream: TokioStream,
+    Acceptor: ChannelAcceptor,
 {
     /// The underlying data stream to the peer, such as a TCP connection.
     /// Bytes are read and written with automatic frame encoding and decoding.
@@ -168,7 +166,7 @@ where
     pending_open_channels: HashMap<ChannelId, PendingOpenChannel>,
 
     /// A handler for incoming channel open requests from the peer.
-    open_channel_handler: OpenChannelHandler,
+    channel_acceptor: Acceptor,
 
     /// A sender for mux [`Command`]s to the mux task. Cloned into channel handles.
     command_tx: mpsc::Sender<Command>,
@@ -177,13 +175,13 @@ where
     frame_tx: mpsc::Sender<Frame>,
 }
 
-impl<Stream, OpenChannelHandler> Mux<Stream, OpenChannelHandler>
+impl<Stream, Acceptor> Mux<Stream, Acceptor>
 where
-    Stream: ThreadSafeStream,
-    OpenChannelHandler: OpenChannelRequestHandler,
+    Stream: TokioStream,
+    Acceptor: ChannelAcceptor,
 {
     /// Spawns a new mux task for the given stream and returns a handle to the mux.
-    pub fn spawn(stream: Stream, open_channel_handler: OpenChannelHandler) -> MuxHandle {
+    pub fn spawn(stream: Stream, channel_acceptor: Acceptor) -> MuxHandle {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let (command_tx, command_rx) = mpsc::channel(100);
 
@@ -193,7 +191,7 @@ where
             frame_rx,
             command_rx,
             pending_open_channels: HashMap::new(),
-            open_channel_handler: open_channel_handler,
+            channel_acceptor: channel_acceptor,
             command_tx: command_tx.clone(),
             frame_tx: frame_tx.clone(),
         };
@@ -273,8 +271,13 @@ where
 
     async fn handle_inbound(&mut self, frame: Frame) {
         match frame.message {
-            Message::OpenChannelRequest { channel_id } => {
-                self.handle_peer_open(channel_id).await;
+            Message::OpenChannelRequest {
+                channel_id,
+                channel_type,
+                buffer_size,
+            } => {
+                self.handle_peer_open(channel_id, channel_type, buffer_size)
+                    .await;
             }
             Message::OpenChannelResponse {
                 channel_id,
@@ -294,41 +297,56 @@ where
         }
     }
 
-    async fn handle_peer_open(&mut self, channel_id: ChannelId) {
+    async fn handle_peer_open(
+        &mut self,
+        channel_id: ChannelId,
+        channel_type: ChannelType,
+        buffer_size: usize,
+    ) {
         eprintln!("Peer requested to open channel [{}]", channel_id);
-        match self.open_channel_handler.handle(channel_id) {
-            Ok(handle) => {
-                let buffer_size = 100; // TODO: Allow peer to specify buffer size in open channel request
-                let (message_tx, message_rx) = mpsc::channel(buffer_size);
+        if self.channels.contains_key(&channel_id) {
+            eprintln!(
+                "Peer requested to open channel with existing channel ID [{}]",
+                channel_id
+            );
 
-                self.channels.insert(channel_id, message_tx);
-
-                let frame = Frame {
-                    channel_id: 0, // TODO: Replace with null UUID
-                    message: Message::OpenChannelResponse {
-                        channel_id,
-                        result: Ok(()),
-                    },
-                };
-                if let Err(e) = self.framed.send(frame).await {
-                    eprintln!("Failed to send open channel ack: {:?}", e);
-                    self.channels.remove(&channel_id);
-                    return;
-                }
-
-                let channel_handle = ChannelHandle::new(
+            let frame = Frame {
+                channel_id: uuid::Uuid::nil(),
+                message: Message::OpenChannelResponse {
                     channel_id,
-                    self.frame_tx.clone(),
-                    self.command_tx.clone(),
-                    message_rx,
-                    ChannelState::Open,
-                );
-
-                tokio::spawn(handle(channel_handle));
+                    result: Err("Channel ID already exists".to_string()),
+                },
+            };
+            if let Err(e) = self.framed.send(frame).await {
+                eprintln!("Failed to send open channel response: {:?}", e);
             }
+            return;
+        }
+
+        if self.pending_open_channels.contains_key(&channel_id) {
+            eprintln!(
+                "Peer requested to open channel with pending channel ID [{}]",
+                channel_id
+            );
+            let frame = Frame {
+                channel_id: uuid::Uuid::nil(),
+                message: Message::OpenChannelResponse {
+                    channel_id,
+                    result: Err("Channel ID already exists".to_string()),
+                },
+            };
+            if let Err(e) = self.framed.send(frame).await {
+                eprintln!("Failed to send open channel response: {:?}", e);
+            }
+            return;
+        }
+
+        let future_fn = match self.channel_acceptor.future_fn(channel_id, channel_type) {
+            Ok(future_fn) => future_fn,
             Err(err) => {
+                eprintln!("Failed to accept open channel request: {}", err);
                 let frame = Frame {
-                    channel_id: 0, // TODO: Replace with null UUID
+                    channel_id: uuid::Uuid::nil(),
                     message: Message::OpenChannelResponse {
                         channel_id,
                         result: Err(err),
@@ -336,10 +354,36 @@ where
                 };
                 if let Err(e) = self.framed.send(frame).await {
                     eprintln!("Failed to send open channel response: {:?}", e);
-                    return;
                 }
+                return;
             }
+        };
+
+        let (message_tx, message_rx) = mpsc::channel(buffer_size);
+        self.channels.insert(channel_id, message_tx);
+
+        let frame = Frame {
+            channel_id: uuid::Uuid::nil(),
+            message: Message::OpenChannelResponse {
+                channel_id,
+                result: Ok(()),
+            },
+        };
+        if let Err(e) = self.framed.send(frame).await {
+            eprintln!("Failed to send open channel ack: {:?}", e);
+            self.channels.remove(&channel_id);
+            return;
         }
+
+        let channel_handle = ChannelHandle::new(
+            channel_id,
+            self.frame_tx.clone(),
+            self.command_tx.clone(),
+            message_rx,
+            ChannelState::Open,
+        );
+
+        tokio::spawn(future_fn(channel_handle));
     }
 
     async fn handle_peer_ok(&mut self, channel_id: ChannelId) {
@@ -395,6 +439,7 @@ where
         match command {
             Command::OpenChannel {
                 channel_id,
+                channel_type,
                 buffer_size,
                 reply,
             } => {
@@ -419,8 +464,12 @@ where
                 );
 
                 let frame = Frame {
-                    channel_id: 0, // TODO: Replace with null UUID
-                    message: Message::OpenChannelRequest { channel_id },
+                    channel_id: uuid::Uuid::nil(),
+                    message: Message::OpenChannelRequest {
+                        channel_id,
+                        channel_type,
+                        buffer_size,
+                    },
                 };
                 if let Err(e) = self.framed.send(frame).await {
                     eprintln!("Failed to send open channel request: {:?}", e);
@@ -438,10 +487,10 @@ where
     }
 }
 
-impl<Stream, OpenChannelHandler> Drop for Mux<Stream, OpenChannelHandler>
+impl<Stream, Acceptor> Drop for Mux<Stream, Acceptor>
 where
-    Stream: ThreadSafeStream,
-    OpenChannelHandler: OpenChannelRequestHandler,
+    Stream: TokioStream,
+    Acceptor: ChannelAcceptor,
 {
     /// The mux is dropped when the mux task terminates.
     /// This causes all ChannelHandle::recv() tasks wake up and returns None.
