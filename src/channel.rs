@@ -5,8 +5,14 @@
 //! In some cases, it may be helpful to split the ownership of a channel handle
 //! into a sender and a receiver.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use futures::future::BoxFuture;
+use tokio::io::AsyncWrite;
+use tokio::io::{self, AsyncRead, ReadBuf};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::job::{AvailableJob, JobId};
 use crate::mux::Command;
@@ -90,6 +96,14 @@ pub enum Message {
     /// Data message, fire-and-forget, worker channel.
     /// Notifies the peer worker channel task that the worker has timed out.
     WorkerTimedOut,
+
+    /// Data message, fire-and-forget, tunnel channel.
+    /// Raw bytes sent from one peer to the other on a tunnel channel.
+    TunnelData(Vec<u8>),
+
+    /// Data message, fire-and-forget, tunnel channel.
+    /// Indicates the end of a tunnel channel.
+    TunnelEof,
 }
 
 /// The state of a channel.
@@ -182,6 +196,7 @@ impl ChannelHandle {
     /// Takes the message receiver out of the channel handle and returns it.
     /// This is useful for transferring the ownership of the message receiver to another task.
     /// After calling this method, the channel handle can no longer be used to receive messages.
+    /// TODO: Clean-up the sender-receiver split. The .take() approach is janky and error-prone.
     pub fn take_message_rx(&mut self) -> mpsc::Receiver<Message> {
         match self.message_rx.take() {
             Some(rx) => rx,
@@ -210,6 +225,10 @@ impl ChannelHandle {
 
         Ok(())
     }
+
+    pub fn into_stream(self) -> ChannelStream {
+        ChannelStream::new(self)
+    }
 }
 
 impl Drop for ChannelHandle {
@@ -226,6 +245,117 @@ impl Drop for ChannelHandle {
                 "Failed to send close command for channel_id {}: {}",
                 self.channel_id, e
             );
+        }
+    }
+}
+
+pub struct ChannelStream {
+    rx: mpsc::Receiver<Message>,
+    tx: mpsc::Sender<Frame>,
+    channel_id: ChannelId,
+    read_buf: bytes::Bytes, // leftover bytes from a partially consumed Data message
+}
+
+impl ChannelStream {
+    pub fn new(mut handle: ChannelHandle) -> Self {
+        let rx = handle.take_message_rx();
+        let tx = handle.frame_tx.clone();
+        let channel_id = handle.channel_id;
+        handle.state = ChannelState::Closed; // Prevents drop from sending CloseChannel command, since the stream will manage the channel lifecycle now.
+        ChannelStream {
+            rx,
+            tx,
+            channel_id,
+            read_buf: bytes::Bytes::new(),
+        }
+    }
+}
+
+// TODO: Clean-up the into_stream implementations. The override of Drop is janky.
+impl Drop for ChannelStream {
+    fn drop(&mut self) {
+        let frame = Frame {
+            channel_id: uuid::Uuid::nil(), // control channel
+            message: Message::CloseChannel {
+                channel_id: self.channel_id,
+            },
+        };
+        if let Err(e) = self.tx.try_send(frame) {
+            eprintln!(
+                "Failed to send close command for channel_id {}: {}",
+                self.channel_id, e
+            );
+        }
+    }
+}
+
+impl AsyncRead for ChannelStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &mut ReadBuf,
+    ) -> Poll<io::Result<()>> {
+        // Drain read_buf first
+        if !self.read_buf.is_empty() {
+            let n = buf.remaining().min(self.read_buf.len());
+            buf.put_slice(&self.read_buf.split_to(n));
+            return Poll::Ready(Ok(()));
+        }
+        // Poll the mpsc receiver
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some(Message::TunnelData(data))) => {
+                let n = buf.remaining().min(data.len());
+                buf.put_slice(&data[..n]);
+                if n < data.len() {
+                    self.read_buf = bytes::Bytes::from(data).slice(n..);
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(None) => {
+                Poll::Ready(Ok(())) // EOF
+            }
+            Poll::Ready(Some(_)) => Poll::Pending, // control message, skip
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for ChannelStream {
+    fn poll_write(self: Pin<&mut Self>, _: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
+        // Split into ≤4096-byte chunks and send each as a Data frame.
+        let chunk = &buf[..buf.len().min(4096)];
+        let frame = Frame {
+            channel_id: self.channel_id,
+            message: Message::TunnelData(chunk.to_vec()),
+        };
+        match self.tx.try_send(frame) {
+            Ok(()) => Poll::Ready(Ok(chunk.len())),
+            Err(TrySendError::Full(_)) => {
+                // Register a waker — the simplest approach is to use poll_reserve
+                // on the Sender (available in Tokio's Sender::reserve)
+                Poll::Pending
+            }
+            Err(TrySendError::Closed(_)) => {
+                Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(())) // framed writer handles flushing
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context) -> Poll<io::Result<()>> {
+        eprintln!("poll_shutdown called for channel_id {}", self.channel_id);
+        let frame = Frame {
+            channel_id: uuid::Uuid::nil(), // control channel
+            message: Message::CloseChannel {
+                channel_id: self.channel_id,
+            },
+        };
+        match self.tx.try_send(frame) {
+            Ok(()) | Err(TrySendError::Closed(_)) => Poll::Ready(Ok(())),
+            Err(TrySendError::Full(_)) => Poll::Pending,
         }
     }
 }
